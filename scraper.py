@@ -303,6 +303,148 @@ def scrape_url(target_url: str, selectors: list, remove_tags: list = None) -> di
 # Core: screenshot with fresh chrome via CDP
 # --------------------------------------------------------------------------- #
 
+def fetch_binary_url(target_url: str, wait: int = 4) -> dict:
+    """Fetch a URL's raw bytes through Chrome and return them base64 encoded.
+
+    Publishers that drop plain HTTP clients from datacentre IPs still serve a
+    real browser carrying the cf-autoclick extension, so featured images have
+    to come down the same path as the article HTML. Chrome navigates to the
+    asset, then an in-page fetch() of the same origin returns the bytes.
+    """
+    profile_dir = tempfile.mkdtemp(prefix="fetchbin_")
+    cdp_port = _free_port()
+    chrome_proc = None
+
+    try:
+        chrome_args = [
+            CHROME_BIN,
+            f"--user-data-dir={profile_dir}",
+            f"--remote-debugging-port={cdp_port}",
+            "--remote-allow-origins=*",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-background-networking",
+            "--disable-sync",
+            "--disable-translate",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--window-size=1280,900",
+        ]
+        if os.path.isdir(CF_AUTOCLICK_DIR):
+            chrome_args.append(f"--load-extension={CF_AUTOCLICK_DIR}")
+        else:
+            chrome_args.append("--headless=new")
+
+        env = os.environ.copy()
+        env["DISPLAY"] = DISPLAY
+        chrome_proc = subprocess.Popen(
+            chrome_args, env=env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+
+        cdp_base = f"http://127.0.0.1:{cdp_port}"
+        ready = False
+        for _ in range(15):
+            time.sleep(1)
+            try:
+                if http_requests.get(f"{cdp_base}/json/version", timeout=2).status_code == 200:
+                    ready = True
+                    break
+            except Exception:
+                pass
+        if not ready:
+            return {"success": False, "error": "Chrome CDP not ready after 15s"}
+
+        tabs = http_requests.get(f"{cdp_base}/json", timeout=5).json()
+        page_tabs = [t for t in tabs if t.get("type") == "page"]
+        if not page_tabs:
+            http_requests.put(f"{cdp_base}/json/new?about:blank", timeout=5)
+            tabs = http_requests.get(f"{cdp_base}/json", timeout=5).json()
+            page_tabs = [t for t in tabs if t.get("type") == "page"]
+        if not page_tabs:
+            return {"success": False, "error": "No page target available"}
+
+        import websocket
+        ws = websocket.create_connection(page_tabs[0]["webSocketDebuggerUrl"], timeout=60)
+        msg_id = 1
+
+        def send_cdp(method, params=None):
+            nonlocal msg_id
+            msg = {"id": msg_id, "method": method, "params": params or {}}
+            ws.send(json.dumps(msg))
+            msg_id += 1
+            while True:
+                resp = json.loads(ws.recv())
+                if resp.get("id") == msg_id - 1:
+                    return resp
+
+        send_cdp("Page.enable")
+        send_cdp("Page.navigate", {"url": target_url})
+        time.sleep(wait)
+
+        # Same-origin fetch from inside the loaded page: cookies and any
+        # Cloudflare clearance the navigation earned come along with it.
+        js = """
+        (async () => {
+          try {
+            const r = await fetch(window.location.href, { credentials: 'include' });
+            if (!r.ok) return JSON.stringify({ error: 'HTTP ' + r.status });
+            const buf = new Uint8Array(await r.arrayBuffer());
+            let bin = '';
+            const CHUNK = 0x8000;
+            for (let i = 0; i < buf.length; i += CHUNK) {
+              bin += String.fromCharCode.apply(null, buf.subarray(i, i + CHUNK));
+            }
+            return JSON.stringify({
+              content_type: r.headers.get('content-type') || '',
+              bytes: buf.length,
+              b64: btoa(bin)
+            });
+          } catch (e) { return JSON.stringify({ error: String(e) }); }
+        })()
+        """
+        res = send_cdp("Runtime.evaluate", {
+            "expression": js, "awaitPromise": True, "returnByValue": True,
+        })
+        raw = res.get("result", {}).get("result", {}).get("value", "")
+        try:
+            ws.close()
+        except Exception:
+            pass
+
+        try:
+            payload = json.loads(raw) if raw else {}
+        except Exception:
+            payload = {}
+        if not payload or payload.get("error"):
+            return {"success": False,
+                    "error": payload.get("error", "no data returned from page")}
+
+        return {
+            "success": True,
+            "data": {
+                "content_type": payload.get("content_type", ""),
+                "bytes": payload.get("bytes", 0),
+                "b64": payload.get("b64", ""),
+                "url": target_url,
+            },
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+    finally:
+        if chrome_proc:
+            try:
+                chrome_proc.terminate()
+                chrome_proc.wait(timeout=5)
+            except Exception:
+                try:
+                    chrome_proc.kill()
+                except Exception:
+                    pass
+        shutil.rmtree(profile_dir, ignore_errors=True)
+
+
 def screenshot_url(target_url: str, full_page: bool = True, width: int = 1920, height: int = 1080, wait: int = 5) -> dict:
     """Launch chrome, navigate, take screenshot, kill. Returns base64 PNG."""
     
@@ -562,6 +704,32 @@ def screenshot():
             )
 
         # Return as JSON with base64
+        return jsonify(result)
+    except Exception as e:
+        _stats["errors"] += 1
+        return jsonify({"success": False, "error": str(e)}), 500
+    finally:
+        _stats["active"] -= 1
+
+
+@app.route("/url-scraper-service/api/v1/fetch-binary/", methods=["POST"])
+def fetch_binary():
+    """Fetch a binary asset (image, etc.) through Chrome. Returns base64."""
+    _stats["active"] += 1
+    try:
+        body = flask_request.get_json(force=True)
+        target_url = body.get("target_url", "")
+        wait = int(body.get("wait", 4))
+        if not target_url:
+            return jsonify({"success": False, "error": "target_url required"}), 400
+
+        future = executor.submit(fetch_binary_url, target_url, wait)
+        result = future.result(timeout=SCRAPE_TIMEOUT + 30)
+
+        if result.get("success"):
+            _stats["processed"] += 1
+        else:
+            _stats["errors"] += 1
         return jsonify(result)
     except Exception as e:
         _stats["errors"] += 1
