@@ -1,0 +1,125 @@
+# Five always-on scraper pods in the prod namespace. One pool serves prod AND
+# dev (the GitHub runners did the same): each pod registers its stable
+# StatefulSet DNS name with both article-management registries.
+apiVersion: v1
+kind: Service
+metadata:
+  name: url-scraper
+  namespace: article-innovator
+  labels:
+    app: url-scraper
+spec:
+  clusterIP: None
+  selector:
+    app: url-scraper
+  ports:
+    - name: http
+      port: 8814
+      targetPort: 8814
+---
+# Plain ClusterIP so http://url-scraper-service:8814 (the services' default
+# URL_SCRAPER_SERVICE_URL) also works, load-balanced over the ready pods.
+apiVersion: v1
+kind: Service
+metadata:
+  name: url-scraper-service
+  namespace: article-innovator
+  labels:
+    app: url-scraper
+spec:
+  selector:
+    app: url-scraper
+  ports:
+    - name: http
+      port: 8814
+      targetPort: 8814
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: url-scraper
+  namespace: article-innovator
+  labels:
+    app: url-scraper
+spec:
+  serviceName: url-scraper
+  replicas: 5
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: url-scraper
+  template:
+    metadata:
+      labels:
+        app: url-scraper
+    spec:
+      terminationGracePeriodSeconds: 90
+      imagePullSecrets:
+        - name: url-scraper-image-pull-secret
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: url-scraper
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: url-scraper
+          image: noasdaewplzc1305/url-scraper:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8814
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: SCRAPER_PUBLIC_URL
+              value: "http://$(POD_NAME).url-scraper.$(POD_NAMESPACE).svc.cluster.local:8814"
+            - name: REGISTRY_BACKENDS
+              value: "http://article-management-service.article-innovator.svc.cluster.local:8806 http://article-management-service.article-innovator-dev.svc.cluster.local:8806"
+            - name: MAX_CONCURRENT
+              value: "3"
+            - name: SCRAPE_TIMEOUT
+              value: "60"
+            - name: REGISTER_INTERVAL
+              value: "60"
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 3Gi
+          readinessProbe:
+            httpGet:
+              path: /url-scraper-service/api/v1/health/
+              port: 8814
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /url-scraper-service/api/v1/health/
+              port: 8814
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            failureThreshold: 3
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Gi
+        - name: tmp
+          emptyDir: {}
