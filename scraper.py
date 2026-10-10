@@ -18,9 +18,13 @@ API:
 """
 
 import argparse
+import base64
 import json
 import os
+import random
+import select
 import shutil
+import threading
 import subprocess
 import sys
 import tempfile
@@ -47,8 +51,229 @@ MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", "3"))
 SCRAPE_TIMEOUT = int(os.getenv("SCRAPE_TIMEOUT", "60"))
 PORT = int(os.getenv("SCRAPER_PORT", "8814"))
 
+# Rotating proxies. One "ip:port:user:pass" per line (the Webshare export
+# format), mounted from a Secret. Empty/missing file = no proxies, direct only.
+PROXY_FILE = os.getenv("PROXY_FILE", "/etc/url-scraper/proxies.txt")
+PROXY_ATTEMPTS = int(os.getenv("PROXY_ATTEMPTS", "3"))      # different proxies tried per request
+PROXY_COOLDOWN = int(os.getenv("PROXY_COOLDOWN", "900"))    # seconds a blocked proxy rests
+PROXY_DEAD_COOLDOWN = int(os.getenv("PROXY_DEAD_COOLDOWN", "3600"))  # one that would not load a page at all
+PROXY_DEADLINE = int(os.getenv("PROXY_DEADLINE", "45"))     # no new attempt starts after this
+
 app = Flask(__name__)
 executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT)
+
+
+# --------------------------------------------------------------------------- #
+# Proxy pool
+# --------------------------------------------------------------------------- #
+
+def _load_proxies(path: str) -> list:
+    proxies = []
+    try:
+        for line in Path(path).read_text().splitlines():
+            parts = line.strip().split(":")
+            if len(parts) == 4 and parts[1].isdigit():
+                proxies.append({"host": parts[0], "port": int(parts[1]), "user": parts[2], "password": parts[3]})
+    except FileNotFoundError:
+        pass
+    random.shuffle(proxies)  # so the five pods don't walk the list in lockstep
+    return proxies
+
+
+class ProxyPool:
+    """Round-robin over the proxy list, skipping any proxy that is cooling down
+    after it was blocked or failed to connect."""
+
+    def __init__(self, proxies: list):
+        self.proxies = proxies
+        self._next = 0
+        self._resting_until: Dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def key(p: dict) -> str:
+        return f"{p['host']}:{p['port']}"
+
+    def take(self, n: int) -> list:
+        """The next n proxies that are not resting, each one different."""
+        picked = []
+        now = time.time()
+        with self._lock:
+            for _ in range(len(self.proxies)):
+                if len(picked) >= n:
+                    break
+                p = self.proxies[self._next % len(self.proxies)]
+                self._next += 1
+                if self._resting_until.get(self.key(p), 0) <= now:
+                    picked.append(p)
+        return picked
+
+    def rest(self, p: dict, seconds: int = PROXY_COOLDOWN) -> None:
+        with self._lock:
+            self._resting_until[self.key(p)] = time.time() + seconds
+
+    def stats(self) -> dict:
+        now = time.time()
+        with self._lock:
+            resting = sum(1 for t in self._resting_until.values() if t > now)
+        return {"total": len(self.proxies), "resting": resting}
+
+
+proxy_pool = ProxyPool(_load_proxies(PROXY_FILE))
+
+
+class ProxyForwarder:
+    """Local, credential-free proxy in front of one upstream proxy.
+
+    Chrome's --proxy-server cannot carry a username/password, so Chrome talks
+    to this listener on 127.0.0.1 and every request is passed upstream with the
+    Proxy-Authorization header added. CONNECT tunnels (all https) are piped
+    through untouched after that; plain http is forced to Connection: close so
+    a reused connection never reaches upstream without the header.
+    """
+
+    def __init__(self, proxy: dict):
+        self.proxy = proxy
+        token = base64.b64encode(f"{proxy['user']}:{proxy['password']}".encode()).decode()
+        self._auth = f"Proxy-Authorization: Basic {token}\r\n".encode()
+        self._sock = socket.socket()
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen(64)
+        self.url = f"http://127.0.0.1:{self._sock.getsockname()[1]}"
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def close(self) -> None:
+        try:
+            self._sock.close()
+        except Exception:
+            pass
+
+    def _accept(self) -> None:
+        while True:
+            try:
+                client, _ = self._sock.accept()
+            except OSError:
+                return  # closed
+            threading.Thread(target=self._handle, args=(client,), daemon=True).start()
+
+    def _handle(self, client: socket.socket) -> None:
+        upstream = None
+        try:
+            client.settimeout(30)
+            head = b""
+            while b"\r\n\r\n" not in head:
+                chunk = client.recv(65536)
+                if not chunk:
+                    return
+                head += chunk
+                if len(head) > 1 << 20:
+                    return
+            head, rest = head.split(b"\r\n\r\n", 1)
+            lines = head.split(b"\r\n")
+            kept = [l for l in lines[1:] if not l.lower().startswith((b"proxy-authorization:", b"proxy-connection:", b"connection:"))]
+            is_connect = lines[0].upper().startswith(b"CONNECT ")
+            if not is_connect:
+                kept.append(b"Connection: close")
+            new_head = b"\r\n".join([lines[0]] + kept) + b"\r\n" + self._auth + b"\r\n"
+            upstream = socket.create_connection((self.proxy["host"], self.proxy["port"]), timeout=15)
+            upstream.sendall(new_head + rest)
+            self._pipe(client, upstream)
+        except Exception:
+            pass
+        finally:
+            for s in (client, upstream):
+                if s:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+
+    @staticmethod
+    def _pipe(a: socket.socket, b: socket.socket) -> None:
+        a.settimeout(None)
+        b.settimeout(None)
+        socks = [a, b]
+        while True:
+            readable, _, broken = select.select(socks, [], socks, 120)
+            if broken or not readable:
+                return
+            for s in readable:
+                data = s.recv(65536)
+                if not data:
+                    return
+                (b if s is a else a).sendall(data)
+
+
+# What a blocked page looks like once loaded. The navigation status comes from
+# the Navigation Timing entry; the text checks catch challenge pages that are
+# served with 200.
+BLOCK_CHECK_JS = r"""
+JSON.stringify((() => {
+  const nav = performance.getEntriesByType('navigation')[0];
+  const status = nav && nav.responseStatus ? nav.responseStatus : 0;
+  const title = (document.title || '').toLowerCase();
+  const text = ((document.body && document.body.innerText) || '').slice(0, 3000).toLowerCase();
+  const url = window.location.href;
+  let reason = '';
+  if (url.startsWith('chrome-error://')) reason = 'page failed to load';
+  else if (status === 403 || status === 429 || status === 407 || status === 503) reason = 'HTTP ' + status;
+  else if (title.includes('just a moment') || title.includes('attention required')) reason = 'cloudflare challenge';
+  else if (title.includes('access denied') || text.startsWith('access denied')) reason = 'access denied';
+  else if (text.includes('press & hold') || text.includes('are you a robot') || text.includes('verify you are human')) reason = 'bot challenge';
+  else if (text.length < 400 && (text.includes('captcha') || text.includes('blocked'))) reason = 'blocked';
+  return { status, reason };
+})())
+"""
+
+
+def _blocked_reason(send_cdp) -> str:
+    """'' when the loaded page looks like real content, else why it doesn't."""
+    try:
+        res = send_cdp("Runtime.evaluate", {"expression": BLOCK_CHECK_JS, "returnByValue": True})
+        info = json.loads(res.get("result", {}).get("result", {}).get("value", "{}") or "{}")
+        return info.get("reason", "") or ""
+    except Exception:
+        return ""
+
+
+def with_proxy_rotation(fn, *args, **kwargs) -> dict:
+    """Run a Chrome job through rotating proxies.
+
+    Each request starts on the next proxy in the rotation. A blocked page, an
+    error or a dead proxy rests that proxy and retries on a different one, up to
+    PROXY_ATTEMPTS proxies, then once directly from the pod's own IP. No new
+    attempt starts after PROXY_DEADLINE seconds, so callers' timeouts hold.
+    """
+    started = time.time()
+    plan = proxy_pool.take(PROXY_ATTEMPTS) + [None]
+    last = {"success": False, "error": "no attempt made"}
+    tried = []
+    for proxy in plan:
+        if tried and time.time() - started > PROXY_DEADLINE:
+            break
+        fwd = ProxyForwarder(proxy) if proxy else None
+        try:
+            result = fn(*args, proxy_server=fwd.url if fwd else None, **kwargs)
+        finally:
+            if fwd:
+                fwd.close()
+        label = ProxyPool.key(proxy) if proxy else "direct"
+        reason = result.get("blocked") or ("" if result.get("success") else result.get("error", "failed"))
+        tried.append({"via": label, "result": reason or "ok"})
+        if not reason:
+            result["proxy"] = label
+            result["attempts"] = tried
+            return result
+        print(f"[proxy] {label} -> {reason}; rotating", flush=True)
+        if proxy:
+            # Chrome's own error page: usually a dead proxy, so rest it longer.
+            proxy_pool.rest(proxy, PROXY_DEAD_COOLDOWN if reason == "page failed to load" else PROXY_COOLDOWN)
+        # A blocked page still carries content; keep the last one so callers
+        # get what the old code returned if every route is blocked.
+        if result.get("success") or not last.get("success"):
+            last = result
+    last["attempts"] = tried
+    return last
 
 _stats = {"processed": 0, "errors": 0, "active": 0, "started_at": time.time()}
 
@@ -130,7 +355,7 @@ def build_extraction_js(selectors: list, remove_tags: list = None) -> str:
 # Core: scrape with fresh chrome via CDP
 # --------------------------------------------------------------------------- #
 
-def scrape_url(target_url: str, selectors: list, remove_tags: list = None) -> dict:
+def scrape_url(target_url: str, selectors: list, remove_tags: list = None, proxy_server: str = None) -> dict:
     """Launch chrome, navigate, extract, kill. Returns parsed result."""
     
     if not selectors:
@@ -164,6 +389,9 @@ def scrape_url(target_url: str, selectors: list, remove_tags: list = None) -> di
             # Can't use headless with extensions, switch to headed
             chrome_args = [a for a in chrome_args if a != "--headless=new"]
         
+        if proxy_server:
+            chrome_args.append(f"--proxy-server={proxy_server}")
+
         env = os.environ.copy()
         env["DISPLAY"] = DISPLAY
         
@@ -228,6 +456,7 @@ def scrape_url(target_url: str, selectors: list, remove_tags: list = None) -> di
         
         # Wait for load (simple approach: just wait)
         time.sleep(8)
+        blocked = _blocked_reason(send_cdp)
         
         # 5. Extract data using JS
         extraction_js = build_extraction_js(selectors, remove_tags)
@@ -278,6 +507,7 @@ def scrape_url(target_url: str, selectors: list, remove_tags: list = None) -> di
         
         return {
             "success": True,
+            "blocked": blocked,
             "data": {
                 "variables": variables,
                 "scraped_data": scraped_data,
@@ -303,7 +533,7 @@ def scrape_url(target_url: str, selectors: list, remove_tags: list = None) -> di
 # Core: screenshot with fresh chrome via CDP
 # --------------------------------------------------------------------------- #
 
-def fetch_binary_url(target_url: str, wait: int = 4) -> dict:
+def fetch_binary_url(target_url: str, wait: int = 4, proxy_server: str = None) -> dict:
     """Fetch a URL's raw bytes through Chrome and return them base64 encoded.
 
     Publishers that drop plain HTTP clients from datacentre IPs still serve a
@@ -335,6 +565,9 @@ def fetch_binary_url(target_url: str, wait: int = 4) -> dict:
             chrome_args.append(f"--load-extension={CF_AUTOCLICK_DIR}")
         else:
             chrome_args.append("--headless=new")
+
+        if proxy_server:
+            chrome_args.append(f"--proxy-server={proxy_server}")
 
         env = os.environ.copy()
         env["DISPLAY"] = DISPLAY
@@ -445,7 +678,7 @@ def fetch_binary_url(target_url: str, wait: int = 4) -> dict:
         shutil.rmtree(profile_dir, ignore_errors=True)
 
 
-def screenshot_url(target_url: str, full_page: bool = True, width: int = 1920, height: int = 1080, wait: int = 5) -> dict:
+def screenshot_url(target_url: str, full_page: bool = True, width: int = 1920, height: int = 1080, wait: int = 5, proxy_server: str = None) -> dict:
     """Launch chrome, navigate, take screenshot, kill. Returns base64 PNG."""
     
     profile_dir = tempfile.mkdtemp(prefix="screenshot_")
@@ -476,6 +709,9 @@ def screenshot_url(target_url: str, full_page: bool = True, width: int = 1920, h
         else:
             chrome_args.append("--headless=new")
         
+        if proxy_server:
+            chrome_args.append(f"--proxy-server={proxy_server}")
+
         env = os.environ.copy()
         env["DISPLAY"] = DISPLAY
         
@@ -540,6 +776,7 @@ def screenshot_url(target_url: str, full_page: bool = True, width: int = 1920, h
         
         # Wait for page to load
         time.sleep(wait)
+        blocked = _blocked_reason(send_cdp)
         
         # 5. Take screenshot
         if full_page:
@@ -593,6 +830,7 @@ def screenshot_url(target_url: str, full_page: bool = True, width: int = 1920, h
         
         return {
             "success": True,
+            "blocked": blocked,
             "data": {
                 "screenshot_base64": screenshot_data,
                 "page_title": page_info.get("title", ""),
@@ -647,7 +885,7 @@ def scrape():
         if not target_url:
             return jsonify({"success": False, "error": "target_url required"}), 400
         
-        future = executor.submit(scrape_url, target_url, selectors, remove_tags)
+        future = executor.submit(with_proxy_rotation, scrape_url, target_url, selectors, remove_tags)
         result = future.result(timeout=SCRAPE_TIMEOUT + 30)
         
         if result.get("success"):
@@ -679,7 +917,7 @@ def screenshot():
         if not target_url:
             return jsonify({"success": False, "error": "target_url required"}), 400
 
-        future = executor.submit(screenshot_url, target_url, full_page, width, height, wait)
+        future = executor.submit(with_proxy_rotation, screenshot_url, target_url, full_page, width, height, wait)
         result = future.result(timeout=SCRAPE_TIMEOUT + 30)
 
         if not result.get("success"):
@@ -723,7 +961,7 @@ def fetch_binary():
         if not target_url:
             return jsonify({"success": False, "error": "target_url required"}), 400
 
-        future = executor.submit(fetch_binary_url, target_url, wait)
+        future = executor.submit(with_proxy_rotation, fetch_binary_url, target_url, wait)
         result = future.result(timeout=SCRAPE_TIMEOUT + 30)
 
         if result.get("success"):
@@ -753,6 +991,7 @@ def health():
         },
         "chrome": CHROME_BIN,
         "extension": CF_AUTOCLICK_DIR,
+        "proxies": proxy_pool.stats(),
     })
 
 
@@ -780,5 +1019,6 @@ if __name__ == "__main__":
     print(f"   Extension: {CF_AUTOCLICK_DIR}")
     print(f"   Concurrent: {MAX_CONCURRENT}")
     print(f"   Timeout: {SCRAPE_TIMEOUT}s")
+    print(f"   Proxies: {len(proxy_pool.proxies)} from {PROXY_FILE}")
     
     app.run(host="0.0.0.0", port=args.port, threaded=True)

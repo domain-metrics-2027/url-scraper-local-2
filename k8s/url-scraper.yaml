@@ -91,6 +91,14 @@ spec:
               value: "60"
             - name: REGISTER_INTERVAL
               value: "60"
+            # Rotating proxies (scraper.py: with_proxy_rotation). The list is the
+            # url-scraper-proxies Secret, created by hand, never committed:
+            #   kubectl -n article-innovator create secret generic url-scraper-proxies \
+            #     --from-file=proxies.txt=<ip:port:user:pass per line>
+            - name: PROXY_FILE
+              value: /etc/url-scraper/proxies.txt
+            - name: PROXY_ATTEMPTS
+              value: "3"
           resources:
             requests:
               cpu: 500m
@@ -116,6 +124,9 @@ spec:
               mountPath: /dev/shm
             - name: tmp
               mountPath: /tmp
+            - name: proxies
+              mountPath: /etc/url-scraper
+              readOnly: true
       volumes:
         - name: shm
           emptyDir:
@@ -123,3 +134,8 @@ spec:
             sizeLimit: 1Gi
         - name: tmp
           emptyDir: {}
+        # optional: without the Secret the scraper just goes direct.
+        - name: proxies
+          secret:
+            secretName: url-scraper-proxies
+            optional: true
